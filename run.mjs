@@ -1,14 +1,23 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import readline from 'node:readline/promises';
 import config from './config.mjs';
-import { connectToExistingChrome } from './chrome.mjs';
+import { launchNewChrome } from './chrome.mjs';
 
 const RUN_STAMP = new Date().toISOString().replace(/[:.]/g, '-');
 const RUN_LOG = path.resolve(`run-${RUN_STAMP}.json`);
 const RUN_SCREENSHOT = path.resolve(`run-${RUN_STAMP}.png`);
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const matchesStatus = text => text.toLowerCase().includes(config.darwinbox.reviewerStatus.toLowerCase());
-const LOGIN_HINT = /sso|\/login\b|signin|sign-in|sign_in|auth0|okta|saml|microsoftonline|accounts\.google|oauth|adfs|onelogin|idp\./i;
+
+async function waitForProceed(message) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  console.log('');
+  console.log(message);
+  await rl.question('When that is done, press Enter in this terminal to proceed... ');
+  rl.close();
+  console.log('Continuing...');
+}
 
 function assertConfigured() {
   if (config.darwinbox.candidateListUrl.includes('YOUR-COMPANY')) {
@@ -25,40 +34,6 @@ function columnLetter(columnNumber) {
     output = String.fromCharCode(65 + ((number - 1) % 26)) + output;
   }
   return output;
-}
-
-async function isLoginScreen(page) {
-  const url = page.url();
-  const title = await page.title().catch(() => '');
-  if (LOGIN_HINT.test(`${url} ${title}`)) return true;
-  if (await page.getByText(config.darwinbox.reviewerStatus, { exact: false }).count()) return false;
-  const loginFields = page.locator('input[type="password"], input[name="loginfmt"], input[name="username"], input[type="email"]');
-  return (await loginFields.count()) > 0;
-}
-
-async function waitForManualLogin(page) {
-  if (!(await isLoginScreen(page))) return;
-
-  const timeout = Number.isFinite(config.loginTimeoutMs) ? config.loginTimeoutMs : 0;
-  const deadline = timeout > 0 ? Date.now() + timeout : Infinity;
-  console.log(`SSO/login screen detected: ${page.url()}`);
-  console.log(timeout > 0
-    ? `Sign in in the Chrome window. Waiting up to ${Math.round(timeout / 1000)}s; the browser will stay open.`
-    : 'Sign in in the Chrome window. The script will wait and will not close the browser until login finishes.');
-
-  let lastNotice = Date.now();
-  while (Date.now() < deadline) {
-    await sleep(1000);
-    if (!(await isLoginScreen(page))) {
-      console.log('Login finished.');
-      return;
-    }
-    if (Date.now() - lastNotice > 15000) {
-      console.log('Still waiting for you to complete SSO...');
-      lastNotice = Date.now();
-    }
-  }
-  throw new Error(`Timed out waiting for SSO/login after ${timeout}ms. Sign in in Chrome and run again.`);
 }
 
 async function listPageDebug(page, extra = {}) {
@@ -157,7 +132,7 @@ async function collectReviewerCandidatesFromView(page) {
 
 async function getReviewerCandidates(page) {
   await page.goto(config.darwinbox.candidateListUrl, { waitUntil: 'domcontentloaded' });
-  await waitForManualLogin(page);
+  await waitForProceed('A new Chrome window is open. Complete every Darwinbox login/SSO step in that window.');
   await page.goto(config.darwinbox.candidateListUrl, { waitUntil: 'domcontentloaded' });
   await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
   await sleep(1500);
@@ -359,7 +334,7 @@ async function writeCell(page, column, row, value) {
 
 async function updateSheet(page, record) {
   await page.goto(config.sheets.url, { waitUntil: 'domcontentloaded' });
-  await waitForManualLogin(page);
+  await waitForProceed('If Google Sheets asks you to sign in, complete login in the Chrome window.');
   await page.goto(config.sheets.url, { waitUntil: 'domcontentloaded' });
   await page.getByText(config.sheets.tabName, { exact: true }).first().click().catch(() => {});
   const row = await findEmployeeRow(page, record.employeeId);
@@ -379,7 +354,7 @@ async function updateSheet(page, record) {
 }
 
 assertConfigured();
-const { page } = await connectToExistingChrome(config);
+const { context, page } = await launchNewChrome(config);
 const audit = {
   startedAt: new Date().toISOString(),
   dryRun: config.dryRun,
@@ -444,5 +419,5 @@ try {
   }
   fs.writeFileSync(RUN_LOG, JSON.stringify(audit, null, 2));
   console.log(`Saved local audit log: ${RUN_LOG}`);
-  // Leave the user's Chrome window open. Only the automation connection is dropped when this process exits.
+  await context.close().catch(() => {});
 }

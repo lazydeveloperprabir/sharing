@@ -3,13 +3,9 @@ export default {
   dryRun: true,
   // How many matching reviewer rows to process. Use null to process every match.
   maxCandidates: 1,
-  // Wait this many milliseconds for you to finish SSO/login. Use 0 to wait until login completes.
-  loginTimeoutMs: 0,
   chrome: {
-    cdpUrl: 'http://127.0.0.1:9222',
-    // If Chrome is already open without debugging, restart it once (your tabs are restored) so a tab can be added.
-    restartIfNeeded: true
-    // Optional Windows override: executablePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
+    // Optional Windows override if Chrome is not found automatically:
+    // executablePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
   },
 
   darwinbox: {

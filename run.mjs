@@ -1,8 +1,14 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { chromium } from 'playwright';
 import config from './config.mjs';
-import { launchNewChrome } from './chrome.mjs';
+
+const execFileAsync = promisify(execFile);
+const PROFILE_DIR = path.resolve('.browser-profile');
 
 const RUN_STAMP = new Date().toISOString().replace(/[:.]/g, '-');
 const RUN_LOG = path.resolve(`run-${RUN_STAMP}.json`);
@@ -17,6 +23,57 @@ async function waitForProceed(message) {
   await rl.question('When that is done, press Enter in this terminal to proceed... ');
   rl.close();
   console.log('Continuing...');
+}
+
+function chromePaths() {
+  if (process.platform === 'win32') {
+    return [
+      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      process.env['PROGRAMFILES(X86)'] && path.join(process.env['PROGRAMFILES(X86)'], 'Google', 'Chrome', 'Application', 'chrome.exe')
+    ].filter(Boolean);
+  }
+  if (process.platform === 'darwin') {
+    return [
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      path.join(os.homedir(), 'Applications', 'Google Chrome.app', 'Contents', 'MacOS', 'Google Chrome')
+    ];
+  }
+  return ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium-browser'];
+}
+
+async function findChrome() {
+  const configured = config.chrome?.executablePath || process.env.CHROME_PATH || '';
+  if (configured && fs.existsSync(configured)) return configured;
+  for (const candidate of chromePaths()) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  try {
+    const command = process.platform === 'win32' ? 'where' : 'which';
+    const { stdout } = await execFileAsync(command, [process.platform === 'win32' ? 'chrome.exe' : 'google-chrome']);
+    const found = stdout.split(/\r?\n/).map(line => line.trim()).find(line => line && fs.existsSync(line));
+    if (found) return found;
+  } catch {
+    // Fall through.
+  }
+  throw new Error(`Google Chrome was not found. Set chrome.executablePath in config.mjs.`);
+}
+
+async function launchNewChrome() {
+  fs.mkdirSync(PROFILE_DIR, { recursive: true });
+  const options = { headless: false, viewport: null, args: ['--start-maximized'] };
+  let context;
+  try {
+    context = await chromium.launchPersistentContext(PROFILE_DIR, { ...options, channel: 'chrome' });
+  } catch {
+    context = await chromium.launchPersistentContext(PROFILE_DIR, {
+      ...options,
+      executablePath: await findChrome()
+    });
+  }
+  const page = context.pages()[0] || await context.newPage();
+  console.log('Opened a new Chrome window for this script. Your existing Chrome was left alone.');
+  return { context, page };
 }
 
 function assertConfigured() {
@@ -354,7 +411,7 @@ async function updateSheet(page, record) {
 }
 
 assertConfigured();
-const { context, page } = await launchNewChrome(config);
+const { context, page } = await launchNewChrome();
 const audit = {
   startedAt: new Date().toISOString(),
   dryRun: config.dryRun,

@@ -66,3 +66,5 @@ export async function launchNewChrome(config) {
   console.log('Opened a new Chrome window for this script. Your existing Chrome was left alone.');
   return { context, page };
 }
+
+export default launchNewChrome;

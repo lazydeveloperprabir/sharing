@@ -4,8 +4,11 @@ import path from 'node:path';
 import config from './config.mjs';
 
 const PROFILE_DIR = path.resolve('.browser-profile');
-const RUN_LOG = path.resolve(`run-${new Date().toISOString().replace(/[:.]/g, '-')}.json`);
+const RUN_STAMP = new Date().toISOString().replace(/[:.]/g, '-');
+const RUN_LOG = path.resolve(`run-${RUN_STAMP}.json`);
+const RUN_SCREENSHOT = path.resolve(`run-${RUN_STAMP}.png`);
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const matchesStatus = text => text.toLowerCase().includes(config.darwinbox.reviewerStatus.toLowerCase());
 
 function assertConfigured() {
   if (config.darwinbox.candidateListUrl.includes('YOUR-COMPANY')) {
@@ -24,9 +27,41 @@ function columnLetter(columnNumber) {
   return output;
 }
 
+async function listPageDebug(page, extra = {}) {
+  const rows = page.locator(config.darwinbox.rowSelector);
+  const rowCount = await rows.count();
+  const sampleRows = [];
+  for (let index = 0; index < Math.min(rowCount, 20); index += 1) {
+    const text = (await rows.nth(index).innerText().catch(() => '')).replace(/\s+/g, ' ').trim();
+    if (text) sampleRows.push(text.slice(0, 300));
+  }
+  const bodyPreview = ((await page.locator('body').innerText().catch(() => '')) || '').replace(/\s+/g, ' ').trim().slice(0, 1500);
+  return {
+    url: page.url(),
+    title: await page.title().catch(() => ''),
+    rowCount,
+    sampleRows,
+    bodyPreview,
+    lookedForStatus: config.darwinbox.reviewerStatus,
+    ...extra
+  };
+}
+
+async function readCandidateFromRow(row, text) {
+  const employeeId = text.match(new RegExp(config.darwinbox.employeeIdRegex))?.[0] ?? '';
+  const link = row.locator(config.darwinbox.openCandidateSelector).filter({ hasText: /.+/ }).first();
+  const href = await link.getAttribute('href', { timeout: 2000 }).catch(() => null);
+  const name = (await link.innerText({ timeout: 2000 }).catch(() => '')).trim()
+    || text.split(new RegExp(config.darwinbox.reviewerStatus, 'i'))[0].trim();
+  return { employeeId, name, href, rowText: text };
+}
+
 async function getReviewerCandidates(page) {
   await page.goto(config.darwinbox.candidateListUrl, { waitUntil: 'domcontentloaded' });
-  await page.waitForTimeout(1500);
+  await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+  await sleep(1500);
+  await page.getByText(config.darwinbox.reviewerStatus, { exact: false }).first().waitFor({ timeout: 10000 }).catch(() => {});
+
   const rows = page.locator(config.darwinbox.rowSelector);
   const count = await rows.count();
   const candidates = [];
@@ -34,14 +69,25 @@ async function getReviewerCandidates(page) {
   for (let index = 0; index < count; index += 1) {
     const row = rows.nth(index);
     const text = (await row.innerText().catch(() => '')).replace(/\s+/g, ' ').trim();
-    if (!text.includes(config.darwinbox.reviewerStatus)) continue;
-    const employeeId = text.match(new RegExp(config.darwinbox.employeeIdRegex))?.[0] ?? '';
-    const link = row.locator(config.darwinbox.openCandidateSelector).filter({ hasText: /.+/ }).first();
-    const href = await link.getAttribute('href').catch(() => null);
-    const name = (await link.innerText().catch(() => '')).trim() || text.split(config.darwinbox.reviewerStatus)[0].trim();
-    if (!href) throw new Error(`Could not find a candidate link in reviewer row: ${text}`);
-    candidates.push({ employeeId, name, href, rowText: text });
+    if (!matchesStatus(text)) continue;
+    candidates.push(await readCandidateFromRow(row, text));
   }
+
+  if (!candidates.length) {
+    const statusHits = page.getByText(config.darwinbox.reviewerStatus, { exact: false });
+    const hitCount = await statusHits.count();
+    const seen = new Set();
+    for (let index = 0; index < Math.min(hitCount, 50); index += 1) {
+      const hit = statusHits.nth(index);
+      const row = hit.locator('xpath=ancestor::tr[1]').or(hit.locator('xpath=ancestor::*[@role="row"][1]')).first();
+      const text = (await row.innerText().catch(() => '')).replace(/\s+/g, ' ').trim()
+        || (await hit.evaluate(element => (element.parentElement?.innerText || element.innerText || '')).catch(() => '')).replace(/\s+/g, ' ').trim();
+      if (!matchesStatus(text) || seen.has(text)) continue;
+      seen.add(text);
+      candidates.push(await readCandidateFromRow(row, text));
+    }
+  }
+
   return candidates;
 }
 
@@ -72,10 +118,23 @@ async function documentIsUploaded(page, label) {
     : { value: 'Yes', reason: 'uploaded file action found' };
 }
 
+async function openCandidate(page, candidate) {
+  if (candidate.href && candidate.href !== '#') {
+    const candidateUrl = new URL(candidate.href, config.darwinbox.candidateListUrl).toString();
+    await page.goto(candidateUrl, { waitUntil: 'domcontentloaded' });
+    return;
+  }
+  await page.goto(config.darwinbox.candidateListUrl, { waitUntil: 'domcontentloaded' });
+  await sleep(1500);
+  const needle = candidate.employeeId || candidate.name;
+  if (!needle) throw new Error(`Could not open candidate; no href, Employee ID, or name in row: ${candidate.rowText}`);
+  const row = page.locator(config.darwinbox.rowSelector).filter({ hasText: needle }).first();
+  await row.locator(config.darwinbox.openCandidateSelector).filter({ hasText: /.+/ }).first().click({ timeout: 8000 });
+}
+
 async function inspectCandidate(page, candidate) {
-  const candidateUrl = new URL(candidate.href, config.darwinbox.candidateListUrl).toString();
-  await page.goto(candidateUrl, { waitUntil: 'domcontentloaded' });
-  await page.getByText(config.darwinbox.documentPageReadyText, { exact: true }).first().waitFor({ timeout: 15000 });
+  await openCandidate(page, candidate);
+  await page.getByText(config.darwinbox.documentPageReadyText, { exact: false }).first().waitFor({ timeout: 15000 });
   const documents = {};
   for (const documentName of config.darwinbox.requiredDocuments) {
     documents[documentName] = await documentIsUploaded(page, documentName);
@@ -83,10 +142,11 @@ async function inspectCandidate(page, candidate) {
   const missing = Object.entries(documents).filter(([, result]) => result.value !== 'Yes').map(([name]) => name);
   return {
     ...candidate,
+    url: page.url(),
     documents,
     totalFiles: Object.values(documents).filter(result => result.value === 'Yes').length,
     status: missing.length ? `Incomplete - Missing: ${missing.join(', ')}` : 'Completed',
-    error: missing.length ? '' : '',
+    error: '',
     processedDate: new Date().toLocaleString('en-IN', { hour12: false })
   };
 }
@@ -141,10 +201,21 @@ async function updateSheet(page, record) {
 assertConfigured();
 const context = await chromium.launchPersistentContext(PROFILE_DIR, { channel: 'chrome', headless: false, viewport: null });
 const page = context.pages()[0] || await context.newPage();
-const results = [];
+const audit = {
+  startedAt: new Date().toISOString(),
+  dryRun: config.dryRun,
+  maxCandidates: config.maxCandidates ?? null,
+  listPage: null,
+  candidatesFound: 0,
+  results: [],
+  error: '',
+  screenshot: ''
+};
 
 try {
   const candidates = await getReviewerCandidates(page);
+  audit.listPage = await listPageDebug(page, { candidatesFound: candidates.length });
+  audit.candidatesFound = candidates.length;
   const limit = Number.isFinite(config.maxCandidates) && config.maxCandidates > 0
     ? Math.floor(config.maxCandidates)
     : candidates.length;
@@ -153,14 +224,46 @@ try {
   if (toProcess.length < candidates.length) {
     console.log(`Processing ${toProcess.length} of ${candidates.length} (config.maxCandidates=${limit}).`);
   }
+  if (!candidates.length) {
+    audit.error = `No rows matched "${config.darwinbox.reviewerStatus}". Check login, the list URL, rowSelector, and the sampleRows in this log.`;
+    console.error(audit.error);
+  }
   for (const candidate of toProcess) {
-    const record = await inspectCandidate(page, candidate);
-    results.push(record);
-    console.log(`${record.employeeId || record.name}: ${record.status}`);
-    if (!config.dryRun) await updateSheet(page, record);
+    try {
+      const record = await inspectCandidate(page, candidate);
+      audit.results.push(record);
+      console.log(`${record.employeeId || record.name}: ${record.status}`);
+      if (!config.dryRun) await updateSheet(page, record);
+    } catch (error) {
+      const failed = {
+        ...candidate,
+        documents: {},
+        totalFiles: 0,
+        status: 'Error',
+        error: error.message,
+        processedDate: new Date().toLocaleString('en-IN', { hour12: false })
+      };
+      audit.results.push(failed);
+      audit.error = audit.error || error.message;
+      console.error(`${candidate.employeeId || candidate.name || 'candidate'}: ${error.message}`);
+    }
+  }
+} catch (error) {
+  audit.error = error.message;
+  console.error(error);
+  try {
+    audit.listPage = await listPageDebug(page);
+  } catch {
+    audit.listPage = { url: page.url(), title: await page.title().catch(() => '') };
   }
 } finally {
-  fs.writeFileSync(RUN_LOG, JSON.stringify(results, null, 2));
+  try {
+    await page.screenshot({ path: RUN_SCREENSHOT, fullPage: true });
+    audit.screenshot = RUN_SCREENSHOT;
+  } catch {
+    audit.screenshot = '';
+  }
+  fs.writeFileSync(RUN_LOG, JSON.stringify(audit, null, 2));
   console.log(`Saved local audit log: ${RUN_LOG}`);
   await context.close();
 }

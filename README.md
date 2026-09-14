@@ -41,9 +41,9 @@ The script is intentionally set to a safe **dry run** initially. It processes on
    npm run run
    ```
 
-Chrome opens with a separate `.browser-profile`. Sign in to Darwinbox and Google the first time. The profile retains your normal signed-in session, but no password is stored in this project.
+Chrome opens with a separate `.browser-profile`. The first time it will stop on the SSO/login screen and **wait** while you sign in; it will not close the browser until login finishes. The profile retains your signed-in session, but no password is stored in this project.
 
-6. Check the terminal and the `run-*.json` audit log. Confirm the candidate names, Employee IDs and document results are correct.
+6. Check the terminal and the `run-*.json` audit log. An empty `results` array means no reviewer row was processed; `listPage.sampleRows`, `error`, and the matching `run-*.png` screenshot show what Darwinbox actually rendered. Confirm the candidate names, Employee IDs and document results are correct.
 
 7. In `config.mjs`, set `dryRun: false` and `maxCandidates: null`, then run it again. The script will update the Sheet using the normal Google Sheets interface.
 

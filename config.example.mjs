@@ -3,6 +3,8 @@ export default {
   dryRun: true,
   // How many matching reviewer rows to process. Use null to process every match.
   maxCandidates: 1,
+  // Wait this many milliseconds for you to finish SSO/login. Use 0 to wait until login completes.
+  loginTimeoutMs: 0,
 
   darwinbox: {
     candidateListUrl: 'https://YOUR-COMPANY.darwinbox.in/ms/onboarding/inprogress/candidate',

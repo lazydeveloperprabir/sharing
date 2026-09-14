@@ -1,9 +1,8 @@
-import { chromium } from 'playwright';
 import fs from 'node:fs';
 import path from 'node:path';
 import config from './config.mjs';
+import { connectToExistingChrome } from './chrome.mjs';
 
-const PROFILE_DIR = path.resolve('.browser-profile');
 const RUN_STAMP = new Date().toISOString().replace(/[:.]/g, '-');
 const RUN_LOG = path.resolve(`run-${RUN_STAMP}.json`);
 const RUN_SCREENSHOT = path.resolve(`run-${RUN_STAMP}.png`);
@@ -15,8 +14,8 @@ function assertConfigured() {
   if (config.darwinbox.candidateListUrl.includes('YOUR-COMPANY')) {
     throw new Error('Set darwinbox.candidateListUrl in config.mjs first.');
   }
-  if (config.sheets.url.includes('PASTE_YOUR_SHEET_ID')) {
-    throw new Error('Set sheets.url in config.mjs first.');
+  if (!config.dryRun && config.sheets.url.includes('PASTE_YOUR_SHEET_ID')) {
+    throw new Error('Set sheets.url in config.mjs before turning off dryRun.');
   }
 }
 
@@ -83,12 +82,77 @@ async function listPageDebug(page, extra = {}) {
 }
 
 async function readCandidateFromRow(row, text) {
-  const employeeId = text.match(new RegExp(config.darwinbox.employeeIdRegex))?.[0] ?? '';
+  const idPattern = new RegExp(config.darwinbox.employeeIdRegex, 'i');
   const link = row.locator(config.darwinbox.openCandidateSelector).filter({ hasText: /.+/ }).first();
   const href = await link.getAttribute('href', { timeout: 2000 }).catch(() => null);
-  const name = (await link.innerText({ timeout: 2000 }).catch(() => '')).trim()
-    || text.split(new RegExp(config.darwinbox.reviewerStatus, 'i'))[0].trim();
+  const nameCell = ((await link.innerText({ timeout: 2000 }).catch(() => '')) ||
+    (await row.locator('td, [role="gridcell"], [role="cell"]').first().innerText().catch(() => '')) ||
+    '').replace(/\s+/g, ' ').trim();
+  const employeeId = (nameCell.match(idPattern)?.[0] || text.match(idPattern)?.[0] || '').toUpperCase();
+  const name = (nameCell || text.split(new RegExp(config.darwinbox.reviewerStatus, 'i'))[0])
+    .replace(idPattern, '')
+    .replace(/[()]/g, ' ')
+    .replace(/\s*[:|]+\s*/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
   return { employeeId, name, href, rowText: text };
+}
+
+async function setListPageSize(page, size) {
+  const wanted = String(size);
+  console.log(`Setting candidate list page size to ${wanted}...`);
+
+  const nativeSelect = page.locator('select').filter({ has: page.locator('option', { hasText: new RegExp(`^${wanted}$`) }) });
+  if (await nativeSelect.count()) {
+    await nativeSelect.last().selectOption({ label: wanted }).catch(() => nativeSelect.last().selectOption(wanted));
+  } else {
+    await page.getByText(/per page/i).last().waitFor({ timeout: 8000 });
+    const trigger = page.locator('[class*="pagination"] [class*="select"], [class*="page-size"], [class*="pagesize"], [class*="pageSize"], [class*="page_size"]').last()
+      .or(page.getByRole('combobox').last())
+      .or(page.locator(`xpath=//*[contains(normalize-space(.), "per page")]/preceding::*[normalize-space()="10" or normalize-space()="20" or normalize-space()="25" or normalize-space()="50"][1]`));
+    await trigger.click({ timeout: 8000 });
+    const option = page.getByRole('option', { name: wanted, exact: true })
+      .or(page.locator('[role="option"], li, [class*="select-item"], [class*="MenuItem"], [class*="option"]').filter({ hasText: new RegExp(`^${wanted}\\b`) }));
+    await option.first().click({ timeout: 8000 });
+  }
+
+  await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+  await sleep(1500);
+  await page.getByText(new RegExp(`1-\\d+\\s+of\\s+\\d+\\s+Records`, 'i')).first().waitFor({ timeout: 10000 }).catch(() => {});
+  console.log('Page size updated. Scanning every visible candidate row.');
+}
+
+async function collectReviewerCandidatesFromView(page) {
+  const rows = page.locator(config.darwinbox.rowSelector);
+  const count = await rows.count();
+  const candidates = [];
+  const seen = new Set();
+
+  for (let index = 0; index < count; index += 1) {
+    const row = rows.nth(index);
+    const text = (await row.innerText().catch(() => '')).replace(/\s+/g, ' ').trim();
+    if (!matchesStatus(text)) continue;
+    const candidate = await readCandidateFromRow(row, text);
+    const key = candidate.employeeId || candidate.rowText;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    candidates.push(candidate);
+  }
+
+  if (candidates.length) return candidates;
+
+  const statusHits = page.getByText(config.darwinbox.reviewerStatus, { exact: false });
+  const hitCount = await statusHits.count();
+  for (let index = 0; index < hitCount; index += 1) {
+    const hit = statusHits.nth(index);
+    const row = hit.locator('xpath=ancestor::tr[1]').or(hit.locator('xpath=ancestor::*[@role="row"][1]')).first();
+    const text = (await row.innerText().catch(() => '')).replace(/\s+/g, ' ').trim()
+      || (await hit.evaluate(element => (element.parentElement?.innerText || element.innerText || '')).catch(() => '')).replace(/\s+/g, ' ').trim();
+    if (!matchesStatus(text) || seen.has(text)) continue;
+    seen.add(text);
+    candidates.push(await readCandidateFromRow(row, text));
+  }
+  return candidates;
 }
 
 async function getReviewerCandidates(page) {
@@ -97,84 +161,161 @@ async function getReviewerCandidates(page) {
   await page.goto(config.darwinbox.candidateListUrl, { waitUntil: 'domcontentloaded' });
   await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
   await sleep(1500);
+  const readyText = config.darwinbox.listPageReadyText || 'Candidate List';
+  await page.getByText(readyText, { exact: false }).first().waitFor({ timeout: 15000 }).catch(() => {});
+  try {
+    await setListPageSize(page, config.darwinbox.pageSize || 100);
+  } catch (error) {
+    console.error(`Could not set page size to ${config.darwinbox.pageSize || 100}: ${error.message}. Scanning the current page anyway.`);
+  }
   await page.getByText(config.darwinbox.reviewerStatus, { exact: false }).first().waitFor({ timeout: 10000 }).catch(() => {});
-
-  const rows = page.locator(config.darwinbox.rowSelector);
-  const count = await rows.count();
-  const candidates = [];
-
-  for (let index = 0; index < count; index += 1) {
-    const row = rows.nth(index);
-    const text = (await row.innerText().catch(() => '')).replace(/\s+/g, ' ').trim();
-    if (!matchesStatus(text)) continue;
-    candidates.push(await readCandidateFromRow(row, text));
-  }
-
-  if (!candidates.length) {
-    const statusHits = page.getByText(config.darwinbox.reviewerStatus, { exact: false });
-    const hitCount = await statusHits.count();
-    const seen = new Set();
-    for (let index = 0; index < Math.min(hitCount, 50); index += 1) {
-      const hit = statusHits.nth(index);
-      const row = hit.locator('xpath=ancestor::tr[1]').or(hit.locator('xpath=ancestor::*[@role="row"][1]')).first();
-      const text = (await row.innerText().catch(() => '')).replace(/\s+/g, ' ').trim()
-        || (await hit.evaluate(element => (element.parentElement?.innerText || element.innerText || '')).catch(() => '')).replace(/\s+/g, ' ').trim();
-      if (!matchesStatus(text) || seen.has(text)) continue;
-      seen.add(text);
-      candidates.push(await readCandidateFromRow(row, text));
-    }
-  }
-
-  return candidates;
+  return collectReviewerCandidatesFromView(page);
 }
 
 async function documentIsUploaded(page, label) {
-  const labels = page.getByText(label, { exact: true });
+  const labels = page.getByText(label, { exact: true })
+    .or(page.getByText(`${label} *`, { exact: true }))
+    .or(page.getByText(new RegExp(`^${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\*?$`)));
   const labelCount = await labels.count();
   if (!labelCount) return { value: 'No', reason: 'field not found' };
+  await labels.first().scrollIntoViewIfNeeded().catch(() => {});
 
-  // Darwinbox renders document labels within a nearby card. Search a few ancestor levels
-  // and stop at the smallest container that has a file input or the "No file chosen" text.
   const result = await labels.first().evaluate((labelElement, missingText) => {
     let element = labelElement;
-    for (let level = 0; level < 7 && element; level += 1, element = element.parentElement) {
+    for (let level = 0; level < 8 && element; level += 1, element = element.parentElement) {
       const content = element.innerText || '';
-      if (content.includes(missingText) || element.querySelector('input[type="file"]')) {
-        const missing = content.includes(missingText);
-        // Uploaded Darwinbox cards visibly include a filename / document action; empty cards do not.
-        const hasFileLink = Boolean(element.querySelector('a[href], [class*="download" i], [class*="delete" i], [class*="remove" i]'));
-        return { missing, hasFileLink, content: content.slice(0, 500) };
+      const hasChooser = content.includes(missingText) || /choose file/i.test(content) || Boolean(element.querySelector('input[type="file"]'));
+      const hasFileAction = Boolean(element.querySelector(
+        '[class*="download" i], [class*="delete" i], [class*="remove" i], [class*="trash" i], [aria-label*="download" i], [aria-label*="delete" i], [aria-label*="remove" i]'
+      ));
+      if (hasChooser || hasFileAction) {
+        return { hasChooser, hasFileAction, content: content.slice(0, 500) };
       }
     }
     return null;
   }, config.darwinbox.missingText);
 
   if (!result) return { value: 'No', reason: 'document card not found' };
-  return result.missing && !result.hasFileLink
-    ? { value: 'No', reason: 'No file chosen' }
-    : { value: 'Yes', reason: 'uploaded file action found' };
+  if (result.hasFileAction) return { value: 'Yes', reason: 'uploaded file action found' };
+  return { value: 'No', reason: 'No file chosen' };
+}
+
+async function scrollToDocumentsUpload(page) {
+  const sectionText = config.darwinbox.documentsSectionText || 'Documents Upload';
+  console.log(`Scrolling to find "${sectionText}"...`);
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  await page.getByText(/Select All|APPROVE/i).first().waitFor({ timeout: 15000 }).catch(() => {});
+  await sleep(800);
+
+  const navItem = page.locator('aside, nav, [class*="sidebar"], [class*="sidenav"], [class*="menu"]')
+    .getByText(sectionText, { exact: false })
+    .first();
+  if (await navItem.count()) {
+    await navItem.click({ timeout: 5000 }).catch(() => {});
+    await sleep(800);
+  }
+
+  const sectionVisible = async () => {
+    const chooser = page.getByText('Choose File', { exact: true }).first();
+    if (await chooser.isVisible().catch(() => false)) return true;
+    const firstDoc = page.getByText(config.darwinbox.requiredDocuments[0] || 'Pan Card', { exact: false }).first();
+    return firstDoc.isVisible().catch(() => false);
+  };
+
+  if (await sectionVisible()) {
+    console.log(`Found "${sectionText}".`);
+    return;
+  }
+
+  const viewport = page.viewportSize() || { width: 1280, height: 800 };
+  await page.mouse.move(Math.floor(viewport.width * 0.62), Math.floor(viewport.height * 0.45));
+
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    if (await sectionVisible()) {
+      console.log(`Found "${sectionText}".`);
+      return;
+    }
+    await page.mouse.wheel(0, 900);
+    await page.evaluate(() => {
+      const nodes = [document.scrollingElement, ...document.querySelectorAll('[class*="content"], [class*="overflow"], main, section')];
+      for (const node of nodes) {
+        if (node && node.scrollHeight > node.clientHeight + 20) node.scrollBy(0, Math.floor(node.clientHeight * 0.8));
+      }
+    });
+    await sleep(350);
+  }
+
+  throw new Error(`Could not find the "${sectionText}" section after scrolling.`);
 }
 
 async function openCandidate(page, candidate) {
-  if (candidate.href && candidate.href !== '#') {
-    const candidateUrl = new URL(candidate.href, config.darwinbox.candidateListUrl).toString();
-    await page.goto(candidateUrl, { waitUntil: 'domcontentloaded' });
+  const needle = candidate.employeeId || candidate.name;
+  if (!needle) throw new Error(`Could not open candidate; no Employee ID or name in row: ${candidate.rowText}`);
+
+  const listRow = page.locator(config.darwinbox.rowSelector).filter({ hasText: needle }).first();
+  const nameLink = listRow.locator(config.darwinbox.openCandidateSelector).filter({
+    hasText: candidate.name ? new RegExp(candidate.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') : /.+/
+  }).first();
+
+  if (await listRow.count() && await nameLink.count()) {
+    await nameLink.click({ timeout: 8000 });
     return;
   }
+
+  if (candidate.href && candidate.href !== '#') {
+    await page.goto(new URL(candidate.href, config.darwinbox.candidateListUrl).toString(), { waitUntil: 'domcontentloaded' });
+    return;
+  }
+
   await page.goto(config.darwinbox.candidateListUrl, { waitUntil: 'domcontentloaded' });
   await sleep(1500);
-  const needle = candidate.employeeId || candidate.name;
-  if (!needle) throw new Error(`Could not open candidate; no href, Employee ID, or name in row: ${candidate.rowText}`);
-  const row = page.locator(config.darwinbox.rowSelector).filter({ hasText: needle }).first();
-  await row.locator(config.darwinbox.openCandidateSelector).filter({ hasText: /.+/ }).first().click({ timeout: 8000 });
+  await setListPageSize(page, config.darwinbox.pageSize || 100).catch(() => {});
+  const retryRow = page.locator(config.darwinbox.rowSelector).filter({ hasText: needle }).first();
+  await retryRow.locator(config.darwinbox.openCandidateSelector).filter({ hasText: /.+/ }).first().click({ timeout: 8000 });
+}
+
+async function openPendingReviewerForm(page) {
+  const detailsReady = config.darwinbox.detailsPageReadyText || 'Onboarding Documents';
+  const viewText = config.darwinbox.viewActionText || 'View';
+  await page.getByText(detailsReady, { exact: false }).first().waitFor({ timeout: 15000 });
+  await page.getByText(detailsReady, { exact: true }).first().click().catch(() => {});
+  await sleep(800);
+
+  const formRow = page.locator(config.darwinbox.rowSelector)
+    .filter({ hasText: config.darwinbox.reviewerStatus })
+    .filter({ hasText: new RegExp(`^${viewText}$|\\b${viewText}\\b`, 'i') })
+    .first();
+
+  if (await formRow.count()) {
+    const viewButton = formRow.getByRole('button', { name: new RegExp(`^${viewText}$`, 'i') })
+      .or(formRow.getByText(viewText, { exact: true }));
+    await viewButton.first().click({ timeout: 8000 });
+    return;
+  }
+
+  const statusCell = page.getByText(config.darwinbox.reviewerStatus, { exact: true }).first();
+  await statusCell.waitFor({ timeout: 8000 });
+  const ancestorRow = statusCell.locator('xpath=ancestor::tr[1]')
+    .or(statusCell.locator('xpath=ancestor::*[@role="row"][1]'))
+    .or(statusCell.locator('xpath=ancestor::*[contains(@class,"row") or contains(@class,"item")][1]'));
+  const viewButton = ancestorRow.getByRole('button', { name: new RegExp(`^${viewText}$`, 'i') })
+    .or(ancestorRow.getByText(viewText, { exact: true }));
+  await viewButton.first().click({ timeout: 8000 });
 }
 
 async function inspectCandidate(page, candidate) {
   await openCandidate(page, candidate);
-  await page.getByText(config.darwinbox.documentPageReadyText, { exact: false }).first().waitFor({ timeout: 15000 });
+  await openPendingReviewerForm(page);
+  await scrollToDocumentsUpload(page);
   const documents = {};
   for (const documentName of config.darwinbox.requiredDocuments) {
-    documents[documentName] = await documentIsUploaded(page, documentName);
+    let result = await documentIsUploaded(page, documentName);
+    if (result.reason === 'field not found') {
+      await page.mouse.wheel(0, 700);
+      await sleep(250);
+      result = await documentIsUploaded(page, documentName);
+    }
+    documents[documentName] = result;
   }
   const missing = Object.entries(documents).filter(([, result]) => result.value !== 'Yes').map(([name]) => name);
   return {
@@ -238,8 +379,7 @@ async function updateSheet(page, record) {
 }
 
 assertConfigured();
-const context = await chromium.launchPersistentContext(PROFILE_DIR, { channel: 'chrome', headless: false, viewport: null });
-const page = context.pages()[0] || await context.newPage();
+const { page } = await connectToExistingChrome(config);
 const audit = {
   startedAt: new Date().toISOString(),
   dryRun: config.dryRun,
@@ -304,5 +444,5 @@ try {
   }
   fs.writeFileSync(RUN_LOG, JSON.stringify(audit, null, 2));
   console.log(`Saved local audit log: ${RUN_LOG}`);
-  await context.close();
+  // Leave the user's Chrome window open. Only the automation connection is dropped when this process exits.
 }

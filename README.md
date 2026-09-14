@@ -41,7 +41,7 @@ The script is intentionally set to a safe **dry run** initially. It processes on
    npm run run
    ```
 
-Chrome opens with a separate `.browser-profile`. The first time it will stop on the SSO/login screen and **wait** while you sign in; it will not close the browser until login finishes. The profile retains your signed-in session, but no password is stored in this project.
+Chrome uses your **already open Google Chrome window** and adds a tab. The script does not close Chrome when it finishes. The first time, Chrome may restart once with your tabs restored so the tab can be controlled; after that, later runs only add a tab.
 
 6. Check the terminal and the `run-*.json` audit log. An empty `results` array means no reviewer row was processed; `listPage.sampleRows`, `error`, and the matching `run-*.png` screenshot show what Darwinbox actually rendered. Confirm the candidate names, Employee IDs and document results are correct.
 
@@ -56,7 +56,7 @@ Chrome opens with a separate `.browser-profile`. The first time it will stop on 
 
 ## Scheduling (after testing)
 
-Use macOS Automator/Calendar or a scheduled Terminal command to run `npm run run` once each morning. The Mac must be awake, online, and have an active Darwinbox and Google login. Leave Chrome closed while the script runs, because it uses its own profile.
+Use macOS Automator/Calendar or a scheduled Terminal command to run `npm run run` once each morning. The Mac must be awake, online, and have an active Darwinbox and Google login. Leave your normal Chrome open; the script adds a tab to that window.
 
 ## If the first dry run fails
 

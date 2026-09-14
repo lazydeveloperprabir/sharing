@@ -9,6 +9,7 @@ export default {
     cdpUrl: 'http://127.0.0.1:9222',
     // If Chrome is already open without debugging, restart it once (your tabs are restored) so a tab can be added.
     restartIfNeeded: true
+    // Optional Windows override: executablePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
   },
 
   darwinbox: {

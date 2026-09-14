@@ -11,7 +11,8 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 function chromeSettings(config) {
   return {
     cdpUrl: config.chrome?.cdpUrl || 'http://127.0.0.1:9222',
-    restartIfNeeded: config.chrome?.restartIfNeeded !== false
+    restartIfNeeded: config.chrome?.restartIfNeeded !== false,
+    executablePath: config.chrome?.executablePath || process.env.CHROME_PATH || ''
   };
 }
 
@@ -23,14 +24,64 @@ function cdpPort(cdpUrl) {
   }
 }
 
-function chromeExecutable() {
-  const mac = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-  if (fs.existsSync(mac)) return mac;
-  throw new Error('Google Chrome was not found in /Applications.');
+function candidateChromePaths() {
+  const home = os.homedir();
+  if (process.platform === 'win32') {
+    return [
+      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      process.env['PROGRAMFILES(X86)'] && path.join(process.env['PROGRAMFILES(X86)'], 'Google', 'Chrome', 'Application', 'chrome.exe')
+    ].filter(Boolean);
+  }
+  if (process.platform === 'darwin') {
+    return [
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      path.join(home, 'Applications', 'Google Chrome.app', 'Contents', 'MacOS', 'Google Chrome')
+    ];
+  }
+  return [
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium'
+  ];
+}
+
+async function chromeExecutable(config) {
+  const configured = chromeSettings(config).executablePath;
+  if (configured && fs.existsSync(configured)) return configured;
+
+  for (const candidate of candidateChromePaths()) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+
+  try {
+    const command = process.platform === 'win32' ? 'where' : 'which';
+    const names = process.platform === 'win32'
+      ? ['chrome.exe', 'chrome']
+      : ['google-chrome', 'google-chrome-stable', 'chromium'];
+    for (const name of names) {
+      const { stdout } = await execFileAsync(command, [name]);
+      const found = stdout.split(/\r?\n/).map(line => line.trim()).find(line => line && fs.existsSync(line));
+      if (found) return found;
+    }
+  } catch {
+    // Ignore lookup failures and fall through to the explicit error.
+  }
+
+  throw new Error(
+    `Google Chrome was not found. Set chrome.executablePath in config.mjs to chrome.exe, or CHROME_PATH. Looked in: ${candidateChromePaths().join(', ')}`
+  );
 }
 
 function defaultProfileDir() {
-  return path.join(os.homedir(), 'Library/Application Support/Google/Chrome');
+  if (process.platform === 'win32') {
+    return path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'Google', 'Chrome', 'User Data');
+  }
+  if (process.platform === 'linux') {
+    return path.join(os.homedir(), '.config', 'google-chrome');
+  }
+  return path.join(os.homedir(), 'Library', 'Application Support', 'Google', 'Chrome');
 }
 
 async function cdpAvailable(cdpUrl) {
@@ -53,6 +104,10 @@ async function waitForCdp(cdpUrl, timeoutMs = 30000) {
 
 async function chromeIsRunning() {
   try {
+    if (process.platform === 'win32') {
+      const { stdout } = await execFileAsync('tasklist', ['/FI', 'IMAGENAME eq chrome.exe', '/NH']);
+      return /chrome\.exe/i.test(stdout);
+    }
     await execFileAsync('pgrep', ['-x', 'Google Chrome']);
     return true;
   } catch {
@@ -70,18 +125,26 @@ async function waitUntilChromeExits(timeoutMs = 20000) {
 }
 
 async function quitChrome() {
-  await execFileAsync('osascript', ['-e', 'tell application "Google Chrome" to quit']);
+  if (process.platform === 'win32') {
+    await execFileAsync('taskkill', ['/IM', 'chrome.exe']).catch(() => {});
+  } else if (process.platform === 'darwin') {
+    await execFileAsync('osascript', ['-e', 'tell application "Google Chrome" to quit']);
+  } else {
+    await execFileAsync('pkill', ['-x', 'chrome', 'google-chrome']).catch(() => {});
+  }
   await waitUntilChromeExits();
 }
 
-function launchChromeWithDebugging(port) {
-  const child = spawn(chromeExecutable(), [
+async function launchChromeWithDebugging(config, port) {
+  const executable = await chromeExecutable(config);
+  const child = spawn(executable, [
     `--remote-debugging-port=${port}`,
     '--remote-allow-origins=*',
     '--restore-last-session'
   ], {
     detached: true,
-    stdio: 'ignore'
+    stdio: 'ignore',
+    windowsHide: false
   });
   child.unref();
 }
@@ -117,7 +180,7 @@ async function ensureChromeDebugging(config) {
     console.log('Starting Google Chrome with your normal profile...');
   }
 
-  launchChromeWithDebugging(cdpPort(cdpUrl));
+  await launchChromeWithDebugging(config, cdpPort(cdpUrl));
   await waitForCdp(cdpUrl);
   return cdpUrl;
 }

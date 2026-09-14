@@ -1,6 +1,8 @@
 export default {
   // Keep this true until the console output has been verified on one candidate.
   dryRun: true,
+  // How many matching reviewer rows to process. Use null to process every match.
+  maxCandidates: 1,
 
   darwinbox: {
     candidateListUrl: 'https://YOUR-COMPANY.darwinbox.in/ms/onboarding/inprogress/candidate',

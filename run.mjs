@@ -145,8 +145,15 @@ const results = [];
 
 try {
   const candidates = await getReviewerCandidates(page);
+  const limit = Number.isFinite(config.maxCandidates) && config.maxCandidates > 0
+    ? Math.floor(config.maxCandidates)
+    : candidates.length;
+  const toProcess = candidates.slice(0, limit);
   console.log(`Found ${candidates.length} candidate(s) pending with reviewer.`);
-  for (const candidate of candidates) {
+  if (toProcess.length < candidates.length) {
+    console.log(`Processing ${toProcess.length} of ${candidates.length} (config.maxCandidates=${limit}).`);
+  }
+  for (const candidate of toProcess) {
     const record = await inspectCandidate(page, candidate);
     results.push(record);
     console.log(`${record.employeeId || record.name}: ${record.status}`);

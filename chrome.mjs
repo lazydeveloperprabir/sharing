@@ -12,7 +12,8 @@ function chromeSettings(config) {
   return {
     cdpUrl: config.chrome?.cdpUrl || 'http://127.0.0.1:9222',
     restartIfNeeded: config.chrome?.restartIfNeeded !== false,
-    executablePath: config.chrome?.executablePath || process.env.CHROME_PATH || ''
+    executablePath: config.chrome?.executablePath || process.env.CHROME_PATH || '',
+    profileDirectory: config.chrome?.profileDirectory || ''
   };
 }
 
@@ -84,6 +85,28 @@ function defaultProfileDir() {
   return path.join(os.homedir(), 'Library', 'Application Support', 'Google', 'Chrome');
 }
 
+function readLocalState() {
+  const localStatePath = path.join(defaultProfileDir(), 'Local State');
+  if (!fs.existsSync(localStatePath)) return {};
+  try {
+    return JSON.parse(fs.readFileSync(localStatePath, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function resolveProfileDirectory(config) {
+  const configured = chromeSettings(config).profileDirectory.trim();
+  if (configured) return configured;
+  const data = readLocalState();
+  return data.profile?.last_used || 'Default';
+}
+
+function profileDisplayName(directory) {
+  const cache = readLocalState().profile?.info_cache || {};
+  return cache[directory]?.name || directory;
+}
+
 function cdpCandidates(preferredUrl) {
   const port = cdpPort(preferredUrl);
   const profilePort = portFromProfile();
@@ -112,11 +135,16 @@ async function findOpenCdp(preferredUrl) {
   return null;
 }
 
-async function waitForCdp(preferredUrl, timeoutMs = 60000) {
+async function waitForCdp(preferredUrl, timeoutMs = 90000) {
   const deadline = Date.now() + timeoutMs;
+  let lastNotice = 0;
   while (Date.now() < deadline) {
     const url = await findOpenCdp(preferredUrl);
     if (url) return url;
+    if (Date.now() - lastNotice > 10000) {
+      console.log('Waiting for Chrome. If a profile picker is on screen, click the Work / Darwinbox profile.');
+      lastNotice = Date.now();
+    }
     await sleep(500);
   }
   const portFile = path.join(defaultProfileDir(), 'DevToolsActivePort');
@@ -176,15 +204,17 @@ async function quitChrome() {
 
 async function launchChromeWithDebugging(config, port) {
   const executable = await chromeExecutable(config);
+  const profileDirectory = resolveProfileDirectory(config);
+  const profileName = profileDisplayName(profileDirectory);
   const args = [
     `--remote-debugging-port=${port}`,
     '--remote-allow-origins=*',
     '--restore-last-session',
     '--no-first-run',
     '--no-default-browser-check',
-    `--user-data-dir=${defaultProfileDir()}`
+    `--profile-directory=${profileDirectory}`
   ];
-  console.log(`Launching Chrome with debugging: ${executable}`);
+  console.log(`Launching Chrome profile "${profileName}" (${profileDirectory}) with debugging: ${executable}`);
   const child = spawn(executable, args, {
     detached: true,
     stdio: 'ignore',

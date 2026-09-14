@@ -84,6 +84,18 @@ function defaultProfileDir() {
   return path.join(os.homedir(), 'Library', 'Application Support', 'Google', 'Chrome');
 }
 
+function cdpCandidates(preferredUrl) {
+  const port = cdpPort(preferredUrl);
+  const profilePort = portFromProfile();
+  return [...new Set([
+    preferredUrl,
+    `http://127.0.0.1:${port}`,
+    `http://localhost:${port}`,
+    profilePort ? `http://127.0.0.1:${profilePort}` : null,
+    profilePort ? `http://localhost:${profilePort}` : null
+  ].filter(Boolean))];
+}
+
 async function cdpAvailable(cdpUrl) {
   try {
     const response = await fetch(`${cdpUrl.replace(/\/$/, '')}/json/version`);
@@ -93,13 +105,25 @@ async function cdpAvailable(cdpUrl) {
   }
 }
 
-async function waitForCdp(cdpUrl, timeoutMs = 30000) {
+async function findOpenCdp(preferredUrl) {
+  for (const url of cdpCandidates(preferredUrl)) {
+    if (await cdpAvailable(url)) return url;
+  }
+  return null;
+}
+
+async function waitForCdp(preferredUrl, timeoutMs = 60000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (await cdpAvailable(cdpUrl)) return;
-    await sleep(400);
+    const url = await findOpenCdp(preferredUrl);
+    if (url) return url;
+    await sleep(500);
   }
-  throw new Error(`Chrome did not open a debug port at ${cdpUrl}.`);
+  const portFile = path.join(defaultProfileDir(), 'DevToolsActivePort');
+  const portFileText = fs.existsSync(portFile) ? fs.readFileSync(portFile, 'utf8').trim() : 'missing';
+  throw new Error(
+    `Chrome did not open a debug port at ${preferredUrl}. DevToolsActivePort=${portFileText}. Quit every Chrome window (check the tray), then run again.`
+  );
 }
 
 async function chromeIsRunning() {
@@ -115,36 +139,60 @@ async function chromeIsRunning() {
   }
 }
 
-async function waitUntilChromeExits(timeoutMs = 20000) {
+async function waitUntilChromeExits(timeoutMs = 25000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (!(await chromeIsRunning())) return;
     await sleep(400);
   }
-  throw new Error('Chrome did not quit. Quit Google Chrome once and run again.');
+  throw new Error('Chrome did not quit. Close all Chrome windows (including any in the system tray) and run again.');
+}
+
+function clearProfileLocks() {
+  const profileDir = defaultProfileDir();
+  for (const name of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
+    const file = path.join(profileDir, name);
+    try {
+      if (fs.existsSync(file)) fs.rmSync(file, { force: true });
+    } catch {
+      // Profile files may still be locked for a moment after Chrome exits.
+    }
+  }
 }
 
 async function quitChrome() {
   if (process.platform === 'win32') {
-    await execFileAsync('taskkill', ['/IM', 'chrome.exe']).catch(() => {});
+    await execFileAsync('taskkill', ['/F', '/IM', 'chrome.exe', '/T']).catch(() => {});
   } else if (process.platform === 'darwin') {
-    await execFileAsync('osascript', ['-e', 'tell application "Google Chrome" to quit']);
+    await execFileAsync('osascript', ['-e', 'tell application "Google Chrome" to quit']).catch(() => {});
+    if (await chromeIsRunning()) await execFileAsync('pkill', ['-9', '-x', 'Google Chrome']).catch(() => {});
   } else {
-    await execFileAsync('pkill', ['-x', 'chrome', 'google-chrome']).catch(() => {});
+    await execFileAsync('pkill', ['-9', '-f', 'chrome']).catch(() => {});
   }
   await waitUntilChromeExits();
+  await sleep(1500);
+  clearProfileLocks();
 }
 
 async function launchChromeWithDebugging(config, port) {
   const executable = await chromeExecutable(config);
-  const child = spawn(executable, [
+  const args = [
     `--remote-debugging-port=${port}`,
     '--remote-allow-origins=*',
-    '--restore-last-session'
-  ], {
+    '--restore-last-session',
+    '--no-first-run',
+    '--no-default-browser-check',
+    `--user-data-dir=${defaultProfileDir()}`
+  ];
+  console.log(`Launching Chrome with debugging: ${executable}`);
+  const child = spawn(executable, args, {
     detached: true,
     stdio: 'ignore',
-    windowsHide: false
+    windowsHide: false,
+    env: process.env
+  });
+  child.on('error', error => {
+    console.error(`Chrome failed to start: ${error.message}`);
   });
   child.unref();
 }
@@ -159,13 +207,8 @@ function portFromProfile() {
 
 async function ensureChromeDebugging(config) {
   const { cdpUrl, restartIfNeeded } = chromeSettings(config);
-  if (await cdpAvailable(cdpUrl)) return cdpUrl;
-
-  const profilePort = portFromProfile();
-  if (profilePort) {
-    const profileUrl = `http://127.0.0.1:${profilePort}`;
-    if (await cdpAvailable(profileUrl)) return profileUrl;
-  }
+  const alreadyOpen = await findOpenCdp(cdpUrl);
+  if (alreadyOpen) return alreadyOpen;
 
   const running = await chromeIsRunning();
   if (running && !restartIfNeeded) {
@@ -174,15 +217,15 @@ async function ensureChromeDebugging(config) {
     );
   }
   if (running) {
-    console.log('Chrome is open but cannot be controlled. Restarting it once with your tabs restored so a new tab can be added.');
+    console.log('Chrome is open without a debug port. Closing it, then reopening with your tabs restored...');
     await quitChrome();
   } else {
     console.log('Starting Google Chrome with your normal profile...');
   }
 
   await launchChromeWithDebugging(config, cdpPort(cdpUrl));
-  await waitForCdp(cdpUrl);
-  return cdpUrl;
+  console.log('Waiting for Chrome debug port...');
+  return waitForCdp(cdpUrl);
 }
 
 export async function connectToExistingChrome(config) {

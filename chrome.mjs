@@ -95,11 +95,26 @@ function readLocalState() {
   }
 }
 
+function listChromeProfiles() {
+  const cache = readLocalState().profile?.info_cache || {};
+  return Object.entries(cache).map(([directory, info]) => ({
+    directory,
+    name: info?.name || directory,
+    email: info?.user_name || info?.gaia_name || ''
+  }));
+}
+
 function resolveProfileDirectory(config) {
   const configured = chromeSettings(config).profileDirectory.trim();
   if (configured) return configured;
   const data = readLocalState();
-  return data.profile?.last_used || 'Default';
+  const profiles = listChromeProfiles();
+  const work = profiles.find(profile => {
+    const blob = `${profile.directory} ${profile.name} ${profile.email}`.toLowerCase();
+    return /work|darwinbox|treebo/.test(blob);
+  });
+  if (work) return work.directory;
+  return data.profile?.last_used || profiles[0]?.directory || 'Default';
 }
 
 function profileDisplayName(directory) {
@@ -135,17 +150,69 @@ async function findOpenCdp(preferredUrl) {
   return null;
 }
 
+async function clickWorkProfileInPicker() {
+  if (process.platform !== 'win32') return;
+  const script = `
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName System.Windows.Forms
+$root = [System.Windows.Automation.AutomationElement]::RootElement
+$windows = $root.FindAll(
+  [System.Windows.Automation.TreeScope]::Children,
+  [System.Windows.Automation.Condition]::TrueCondition
+)
+foreach ($win in $windows) {
+  $title = $win.Current.Name
+  if ($title -notmatch 'Chrome|Profile|Who') { continue }
+  $nodes = $win.FindAll(
+    [System.Windows.Automation.TreeScope]::Descendants,
+    [System.Windows.Automation.Condition]::TrueCondition
+  )
+  foreach ($node in $nodes) {
+    $label = ($node.Current.Name + ' ' + $node.Current.HelpText)
+    if ($label -notmatch 'Work|Darwinbox|Treebo') { continue }
+    try {
+      $inv = $node.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+      $inv.Invoke()
+      'clicked'
+      exit 0
+    } catch {}
+    $rect = $node.Current.BoundingRectangle
+    if ($rect.Width -gt 0 -and $rect.Height -gt 0) {
+      $x = [int]($rect.X + $rect.Width / 2)
+      $y = [int]($rect.Y + $rect.Height / 2)
+      [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point($x, $y)
+      Add-Type -TypeDefinition @"
+        using System;
+        using System.Runtime.InteropServices;
+        public class Mouse {
+          [DllImport("user32.dll")] public static extern void mouse_event(int dwFlags, int dx, int dy, int dwData, int dwExtraInfo);
+        }
+"@
+      [Mouse]::mouse_event(0x0002, 0, 0, 0, 0)
+      [Mouse]::mouse_event(0x0004, 0, 0, 0, 0)
+      'clicked-mouse'
+      exit 0
+    }
+  }
+}
+`;
+  const file = path.join(os.tmpdir(), 'darwinbox-select-chrome-profile.ps1');
+  fs.writeFileSync(file, script);
+  await execFileAsync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', file], { timeout: 8000 }).catch(() => {});
+}
+
 async function waitForCdp(preferredUrl, timeoutMs = 90000) {
   const deadline = Date.now() + timeoutMs;
   let lastNotice = 0;
   while (Date.now() < deadline) {
     const url = await findOpenCdp(preferredUrl);
     if (url) return url;
+    await clickWorkProfileInPicker();
     if (Date.now() - lastNotice > 10000) {
-      console.log('Waiting for Chrome. If a profile picker is on screen, click the Work / Darwinbox profile.');
+      console.log('Selecting the Work / Darwinbox Chrome profile automatically...');
       lastNotice = Date.now();
     }
-    await sleep(500);
+    await sleep(800);
   }
   const portFile = path.join(defaultProfileDir(), 'DevToolsActivePort');
   const portFileText = fs.existsSync(portFile) ? fs.readFileSync(portFile, 'utf8').trim() : 'missing';
@@ -204,6 +271,10 @@ async function quitChrome() {
 
 async function launchChromeWithDebugging(config, port) {
   const executable = await chromeExecutable(config);
+  const profiles = listChromeProfiles();
+  if (profiles.length) {
+    console.log('Chrome profiles found: ' + profiles.map(profile => `${profile.name} [${profile.directory}]`).join(', '));
+  }
   const profileDirectory = resolveProfileDirectory(config);
   const profileName = profileDisplayName(profileDirectory);
   const args = [
@@ -212,9 +283,11 @@ async function launchChromeWithDebugging(config, port) {
     '--restore-last-session',
     '--no-first-run',
     '--no-default-browser-check',
-    `--profile-directory=${profileDirectory}`
+    '--disable-features=ProfilePickerOnStartup',
+    '--profile-directory',
+    profileDirectory
   ];
-  console.log(`Launching Chrome profile "${profileName}" (${profileDirectory}) with debugging: ${executable}`);
+  console.log(`Opening Chrome profile "${profileName}" (${profileDirectory}) automatically.`);
   const child = spawn(executable, args, {
     detached: true,
     stdio: 'ignore',
